@@ -63,10 +63,10 @@ def retrieve_cfg_paths(args: argparse.Namespace) -> (str, str, str):
         # directory to save logs in (tensorboard>?)
         logdir = os.path.join(args.logdir, "trifinger")
         # path where gym config is stored
-        trifinger_path = os.path.join(get_resources_dir(), 'config', 'trifinger')
+        trifinger_path = os.path.join(get_resources_dir(), 'config')
         # complete file name for yaml config
-        task_cfg_file = join_config_path(f"difficulty_{args.task_variant}.yaml",
-                                         base_path=os.path.join(trifinger_path, 'gym'))
+        task_cfg_file = join_config_path("config.yaml",
+                                         base_path=trifinger_path)
         # resolve training config for environment
         agent_cfg_file = join_config_path(f"{args.training_type}_ppo.yaml",
                                           base_path=os.path.join(trifinger_path, 'rlg'))
@@ -132,10 +132,13 @@ def update_cfg(cfg, cfg_train, logdir, args):
             "max_gpu_contact_pairs": 8 * 1024 * 1024,
         }
     }
+    # Override command mode
+    cfg["command_mode"] = args.command_mode
+    cfg_train["command_mode"] = args.command_mode
     # if yaml config has sim settings, override above args settings
     try:
         cfg["sim"] = update_dict(args_sim_settings, cfg["sim"])
-    except AttributeError:
+    except (AttributeError, KeyError):
         cfg["sim"] = args_sim_settings
     # Override number of threads for physics if passed by CLI
     if args.physics_engine == gymapi.SIM_PHYSX and args.num_threads > 0:
@@ -193,16 +196,7 @@ def update_cfg(cfg, cfg_train, logdir, args):
     return cfg, cfg_train, logdir
 
 
-def get_args(benchmark: bool = False, use_rlg_config: bool = False) -> argparse.Namespace:
-    """Defines the custom args for argparsing and parses them.
-
-    Args:
-        benchmark: Add additional params for benchmarking the environment.
-        use_rlg_config: Add RL-games specfic params or not.
-
-    Returns:
-        Parsed CLI arguments.
-    """
+def get_custom_parameters(benchmark: bool = False, use_rlg_config: bool = False) -> list:
     custom_parameters = [
         # sets verbosity of the run
         {"name": "--verbose", "action": "store_true", "default": False,
@@ -258,7 +252,10 @@ def get_args(benchmark: bool = False, use_rlg_config: bool = False) -> argparse.
          "help": "Episode length, by default is read from yaml config"},
         # checks applying of physics DR
         {"name": "--randomize", "action": "store_true", "default": False,
-         "help": "Apply physics domain randomization"}]
+         "help": "Apply physics domain randomization"},
+        # sets command mode
+        {"name": "--command_mode", "type": str, "default": "position",
+         "help": "Command mode to control robot with"}]
 
     # configurations specfic for RL-games
     if use_rlg_config:
@@ -284,7 +281,20 @@ def get_args(benchmark: bool = False, use_rlg_config: bool = False) -> argparse.
              "help": "Number of timing reports"},
             # name of the benchamrking file to dump results into
             {"name": "--bench_file", "action": "store", "help": "Filename to store benchmark results"}]
+    return custom_parameters
 
+
+def get_args(benchmark: bool = False, use_rlg_config: bool = False) -> argparse.Namespace:
+    """Defines the custom args for argparsing and parses them.
+
+    Args:
+        benchmark: Add additional params for benchmarking the environment.
+        use_rlg_config: Add RL-games specfic params or not.
+
+    Returns:
+        Parsed CLI arguments.
+    """
+    custom_parameters = get_custom_parameters(benchmark, use_rlg_config)
     # parse arguments
     args = gymutil.parse_arguments(description="RL Policy Training using Leibnizgym",
                                    custom_parameters=custom_parameters)
