@@ -15,6 +15,7 @@ from leibnizgym.envs.env_base import IsaacEnvBase
 from leibnizgym.envs.trifinger.sample import *
 from leibnizgym.envs.trifinger.rewards import REWARD_TERMS_MAPPING
 from leibnizgym.envs.trifinger.utils import TrifingerDimensions, CuboidalObject
+from isaacgym.torch_utils import to_torch, tf_apply
 # python
 from typing import Union, List, Tuple, Deque
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ TRIFINGER_DEFAULT_CONFIG_DICT = {
     "episode_length": 750,
     # Specify difficulty of the task
     # Ref: https://people.tuebingen.mpg.de/felixwidmaier/realrobotchallenge/simulation_phase/tasks.html
-    "task_difficulty": 1,
+    "task_difficulty": 4,
     # Enable force-torque sensor in finger tips or not.
     "enable_ft_sensors": False,
     # Type of low level control of the fingers: ["position", "torque", "position_impedence"]
@@ -39,7 +40,7 @@ TRIFINGER_DEFAULT_CONFIG_DICT = {
     "apply_safety_damping": True,
     # Whether to fill state buffers or not -- used in Asymmetric PPO implementation.
     # If false: then the state buffers are empty.
-    "asymmetric_obs": False,
+    "asymmetric_obs": True,
     # Whether to normalize observations to [-1, 1] or not.
     "normalize_obs": True,
     # Whether to denormalize action from [-1, 1] or not.
@@ -200,6 +201,10 @@ class TrifingerEnv(IsaacEnvBase):
             low=np.full(_dims.WrenchDim.value, -1.0, dtype=np.float32),
             high=np.full(_dims.WrenchDim.value, 1.0, dtype=np.float32),
         ),
+        "fingertip_force": SimpleNamespace(
+            low=np.full(_dims.ForceDim.value * _dims.NumFingers.value, -3.0, dtype=np.float32),
+            high=np.full(_dims.ForceDim.value * _dims.NumFingers.value, 3.0, dtype=np.float32),
+        ),
         # used if we want to have joint stiffness/damping as parameters`
         "joint_stiffness": SimpleNamespace(
             low=np.array([1.0, 1.0, 1.0] * _dims.NumFingers.value, dtype=np.float32),
@@ -271,6 +276,12 @@ class TrifingerEnv(IsaacEnvBase):
     _object_state_history: Deque[torch.Tensor] = deque(maxlen=_state_history_len)
     # keeps track of the number of goal resets
     _successes: torch.Tensor
+    # default CP params
+    _default_cp_params = to_torch([[0.0, 0.0355, 0.0],
+                                   [0.0355, 0.0, 0.0],
+                                   [-0.0355, 0.0, 0.0]])
+    # lmbda dampening term for jacobian dampened least squares
+    _lmbda = 0.05
 
     def __init__(self, config: dict = None, device: str = 'cpu', verbose: bool = True, visualize: bool = False):
         """Initializes the tri-finger environment configure the buffers.
@@ -291,7 +302,7 @@ class TrifingerEnv(IsaacEnvBase):
         # define spaces for the environment
 
         # action
-        action_dim = self._dims.JointTorqueDim.value if config['command_mode'] != "position_impedance" else self._dims.JointTorqueDim.value * 2
+        action_dim = self._dims.JointTorqueDim.value if trifinger_config['command_mode'] != "position_impedance" else self._dims.JointTorqueDim.value * 2
 
         # observations
         obs_spec = {
@@ -462,9 +473,9 @@ class TrifingerEnv(IsaacEnvBase):
 
         @note The input actions are read from the action buffer variable `_action_buf`.
         """
-        # if normalized_action is true, then denormalize them.
+        # if normalized_action is true, then denormalize them.  if self.config["normalize_action"]:
+        # TODO: Default action should correspond to normalized value of 0.
         if self.config["normalize_action"]:
-            # TODO: Default action should correspond to normalized value of 0.
             action_transformed = unscale_transform(
                 self._action_buf,
                 lower=self._action_scale.low,
@@ -477,12 +488,16 @@ class TrifingerEnv(IsaacEnvBase):
         # @todo - the action. the reason to not do this would be it could make control flow confusing
         if "actions" in self._pydr_properties:
             action_transformed = self._pydr_properties["actions"](action_transformed, step=self.env_steps_count)
+        ftip_pos_commands = ['fingertip_pos_offset_torque', 'fingertip_pos_offset_position',
+                             'fingertip_pos_torque', 'fingertip_pos_position']
+        if self.config["command_mode"] in ftip_pos_commands:
+            action_transformed = self._compute_fingertips_ik_action(action_transformed)
 
         # compute command on the basis of mode selected
-        if self.config["command_mode"] == 'torque':
+        if self.config["command_mode"] in ['torque', 'fingertip_pos_offset_torque', 'fingertip_pos_torque']:
             # command is the desired joint torque
             computed_torque = action_transformed
-        elif self.config["command_mode"] == 'position':
+        elif self.config["command_mode"] in ['position', 'fingertip_pos_offset_position', 'fingertip_pos_position']:
             # command is the desired joint positions
             desired_dof_position = action_transformed
             # compute torque to apply
@@ -495,6 +510,8 @@ class TrifingerEnv(IsaacEnvBase):
             computed_torque = action_transformed[:, 9:18] * (desired_dof_position - self._dof_position)
             # computed_torque -= action_transformed[:, 18:27] * self._dof_velocity
             computed_torque -= self._robot_dof_gains["damping"] * self._dof_velocity
+        elif self.config["command_mode"] == 'fingertip_force':
+            computed_torque = self._compute_fingertips_force_torque(action_transformed)
         else:
             msg = f"Invalid command mode. Input: {self.config['command_mode']} not in ['torque', 'position']."
             raise ValueError(msg)
@@ -575,6 +592,10 @@ class TrifingerEnv(IsaacEnvBase):
                 self._reward_buf += v
                 self._step_info[f"env/rewards/{k}"] = v.mean()
 
+        # for i, dim in enumerate(['x', 'y', 'z']):
+        #     for fid in range(3):
+        #         self._step_info[f"env/ft{fid}_forces_{dim}"] = self._ft_sensors_values[:, 3 * fid + i]
+
         # check termination conditions (success only)
         self.__check_termination()
 
@@ -620,6 +641,10 @@ class TrifingerEnv(IsaacEnvBase):
             num_ft_dims = self._dims.NumFingers.value * self._dims.WrenchDim.value
             sensor_tensor = self._gym.acquire_force_sensor_tensor(self._sim)
             self._ft_sensors_values = gymtorch.wrap_tensor(sensor_tensor).view(self.num_instances, num_ft_dims)
+        # if self.config["command_mode"] in ["fingertip_force", "object_wrench"]:
+        _jacobian = self._gym.acquire_jacobian_tensor(self._sim, "robot")
+        self._jacobian_tensor = gymtorch.wrap_tensor(_jacobian)
+        self._gym.refresh_jacobian_tensors(self._sim)
         # get gym GPU state tensors
         actor_root_state_tensor = self._gym.acquire_actor_root_state_tensor(self._sim)
         dof_state_tensor = self._gym.acquire_dof_state_tensor(self._sim)
@@ -668,6 +693,19 @@ class TrifingerEnv(IsaacEnvBase):
             controls = ['joint_position', 'joint_stiffness']
             self._action_scale.low = torch.cat([self._robot_limits[p].low for p in controls])
             self._action_scale.high = torch.cat([self._robot_limits[p].high for p in controls])
+        elif self.config["command_mode"] == "fingertip_force":
+            # action space is fingertip forces
+            self._action_scale.low = self._robot_limits["fingertip_force"].low
+            self._action_scale.high = self._robot_limits["fingertip_force"].high
+        elif self.config["command_mode"] in ["fingertip_pos_torque",
+                                             "fingertip_pos_position"]:
+            self._action_scale.low = torch.cat([self._robot_limits["fingertip_position"].low for _ in range(3)])
+            self._action_scale.high = torch.cat([self._robot_limits["fingertip_position"].high for _ in range(3)])
+        elif self.config["command_mode"] in ["fingertip_pos_offset_torque",
+                                             "fingertip_pos_offset_position"]:
+            ftip_pos_range = self._robot_limits["fingertip_position"].high - self._robot_limits["fingertip_position"].low
+            self._action_scale.low = -torch.cat([ftip_pos_range for _ in range(3)]) / 8
+            self._action_scale.high = torch.cat([ftip_pos_range for _ in range(3)]) / 8
         else:
             msg = f"Invalid command mode. Input: {self.config['command_mode']} not in ['torque', 'position']."
             raise ValueError(msg)
@@ -846,7 +884,7 @@ class TrifingerEnv(IsaacEnvBase):
                                                  "goal_object", env_index + self.num_instances, 0, 0)
             goal_object_idx = self._gym.get_actor_index(env_ptr, goal_handle, gymapi.DOMAIN_SIM)
             # add force-torque sensor to fingertips
-            if self.config["enable_ft_sensors"]:
+            if True:  # self.config["enable_ft_sensors"]:
                 # enable joint force sensors
                 self._gym.enable_actor_dof_force_sensors(env_ptr, trifinger_actor)
                 # add force-torque sensor to finger tips
@@ -986,6 +1024,8 @@ class TrifingerEnv(IsaacEnvBase):
         self._gym.refresh_dof_state_tensor(self._sim)
         self._gym.refresh_actor_root_state_tensor(self._sim)
         self._gym.refresh_rigid_body_state_tensor(self._sim)
+        # if self.config["command_mode"] in ["fingertip_force", "object_wrench"]:
+        self._gym.refresh_jacobian_tensors(self._sim)
         if self.config["enable_ft_sensors"] or self.config["asymmetric_obs"]:
             self._gym.refresh_dof_force_tensor(self._sim)
             self._gym.refresh_force_sensor_tensor(self._sim)
@@ -1310,4 +1350,45 @@ class TrifingerEnv(IsaacEnvBase):
             goal_object_indices = self._gym_indices["goal_object"]
             self._object_goal_poses_buf[:] = self._actors_root_state[goal_object_indices, 0:7]
 
-# EOF
+    def _compute_fingertips_force_torque(self, ftip_force):
+        computed_torque = 0
+        for fid, frame_id in enumerate(self._fingertips_handles.values()):
+            Ji = self._jacobian_tensor[:, frame_id - 1, :3]
+            Ji_T = Ji.transpose(1, 2)
+            F = ftip_force[:, 3 * fid: 3 * fid + 3, None]
+            computed_torque += torch.matmul(Ji_T, F).squeeze(-1)
+            # computed_torque = 0.5 * torch.matmul(Ji_T, F)
+        computed_torque -= self._robot_dof_gains["damping"] * self._dof_velocity
+        return computed_torque
+
+    def _compute_fingertips_ik_action(self, ftip_pos_offset):
+        ftip_pos = self._fingertips_frames_state_history[0][:, :, :3].reshape((-1, 9, 1))
+        if "offset" in self.config["command_mode"]:
+            des_ftip_pos = ftip_pos + ftip_pos_offset.view(-1, 9, 1)
+        else:
+            des_ftip_pos = ftip_pos_offset.view(-1, 9, 1)
+        # ftip_rot = self._fingertips_frames_state_history[0][:, :, 3:7]
+        ftip_idx = [frame_id - 1 for frame_id in self._fingertips_handles.values()]
+        Ji = self._jacobian_tensor[:, ftip_idx, :3]
+        Ji = torch.stack([Ji[:, i, :, 3 * i:3 * i + 3] for i in range(3)], dim=-1)
+        Ji_T = Ji.transpose(-2, -1)
+
+        goal_err = (des_ftip_pos - ftip_pos).view(self.num_instances, 3, 3, 1)
+        lmbda = torch.eye(3, dtype=torch.float, device=self.device) * (self._lmbda ** 2)
+        pos_err = (Ji @ torch.inverse(Ji @ Ji_T + lmbda) @ goal_err).view(self.num_instances, 9)
+        if self.config["command_mode"] in ["fingertip_pos_offset_position", "fingertip_pos_position"]:
+            return pos_err + self._dof_position
+        computed_torque = self._robot_dof_gains["stiffness"] * (
+            pos_err
+        )
+        computed_torque -= self._robot_dof_gains["damping"] * self._dof_velocity
+        return computed_torque
+
+    def _compute_ftip_goals(self):
+        q, t = self._object_state_history[0][:, 3:7], self._object_state_history[0][:, :3]
+        q = q.view(-1, 1, 4).tile(1, 3, 1).view(-1, 4)
+        t = t.view(-1, 1, 3).tile(1, 3, 1).view(-1, 3)
+        cp_params = self._default_cp_params.repeat(self.num_instances, 1)
+        ftip_goals = tf_apply(q, cp_params, t)
+        return ftip_goals
+

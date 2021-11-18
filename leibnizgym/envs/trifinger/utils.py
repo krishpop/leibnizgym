@@ -30,6 +30,7 @@ class TrifingerDimensions(enum.Enum):
     StateDim = 13
     # force + torque
     WrenchDim = 6
+    ForceDim = 3
     # for robot
     # number of fingers
     NumFingers = 3
