@@ -47,8 +47,10 @@ params:
     gamma: 0.99
     tau: 0.95
     learning_rate: 3e-4
+    horizon_length: 750
     lr_schedule: adaptive
     lr_threshold: 0.008
+    kl_threshold: 0.008
     score_to_win : 1000000
     max_epochs: 100000
     save_best_after: 500
@@ -71,7 +73,7 @@ params:
       seq_length: 4
       minibatch_size: 8192 #16384
       mini_epochs: 4
-      lr: 5e-4
+      learning_rate: 5e-4
       clip_value: False
       normalize_input: False
       grad_norm: 1.0
