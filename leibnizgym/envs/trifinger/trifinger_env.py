@@ -31,7 +31,7 @@ TRIFINGER_DEFAULT_CONFIG_DICT = {
     "episode_length": 750,
     # Specify difficulty of the task
     # Ref: https://people.tuebingen.mpg.de/felixwidmaier/realrobotchallenge/simulation_phase/tasks.html
-    "task_difficulty": 4,
+    "task_difficulty": 1,
     # Enable force-torque sensor in finger tips or not.
     "enable_ft_sensors": False,
     # Type of low level control of the fingers: ["position", "torque", "position_impedence"]
@@ -488,16 +488,15 @@ class TrifingerEnv(IsaacEnvBase):
         # @todo - the action. the reason to not do this would be it could make control flow confusing
         if "actions" in self._pydr_properties:
             action_transformed = self._pydr_properties["actions"](action_transformed, step=self.env_steps_count)
-        ftip_pos_commands = ['fingertip_pos_offset_torque', 'fingertip_pos_offset_position',
-                             'fingertip_pos_torque', 'fingertip_pos_position']
+        ftip_pos_commands = ['fingertip_pos', 'fingertip_pos_offset']
         if self.config["command_mode"] in ftip_pos_commands:
             action_transformed = self._compute_fingertips_ik_action(action_transformed)
 
         # compute command on the basis of mode selected
-        if self.config["command_mode"] in ['torque', 'fingertip_pos_offset_torque', 'fingertip_pos_torque']:
+        if self.config["command_mode"] == 'torque':
             # command is the desired joint torque
             computed_torque = action_transformed
-        elif self.config["command_mode"] in ['position', 'fingertip_pos_offset_position', 'fingertip_pos_position']:
+        elif self.config["command_mode"] in ['position', 'fingertip_pos_offset', 'fingertip_pos']:
             # command is the desired joint positions
             desired_dof_position = action_transformed
             # compute torque to apply
@@ -697,12 +696,10 @@ class TrifingerEnv(IsaacEnvBase):
             # action space is fingertip forces
             self._action_scale.low = self._robot_limits["fingertip_force"].low
             self._action_scale.high = self._robot_limits["fingertip_force"].high
-        elif self.config["command_mode"] in ["fingertip_pos_torque",
-                                             "fingertip_pos_position"]:
+        elif self.config["command_mode"] == "fingertip_pos":
             self._action_scale.low = torch.cat([self._robot_limits["fingertip_position"].low for _ in range(3)])
             self._action_scale.high = torch.cat([self._robot_limits["fingertip_position"].high for _ in range(3)])
-        elif self.config["command_mode"] in ["fingertip_pos_offset_torque",
-                                             "fingertip_pos_offset_position"]:
+        elif self.config["command_mode"] == "fingertip_pos_offset":
             ftip_pos_range = self._robot_limits["fingertip_position"].high - self._robot_limits["fingertip_position"].low
             self._action_scale.low = -torch.cat([ftip_pos_range for _ in range(3)]) / 8
             self._action_scale.high = torch.cat([ftip_pos_range for _ in range(3)]) / 8
@@ -1363,7 +1360,7 @@ class TrifingerEnv(IsaacEnvBase):
 
     def _compute_fingertips_ik_action(self, ftip_pos_offset):
         ftip_pos = self._fingertips_frames_state_history[0][:, :, :3].reshape((-1, 9, 1))
-        if "offset" in self.config["command_mode"]:
+        if self.config["command_mode"] == "fingertip_pos_offset":
             des_ftip_pos = ftip_pos + ftip_pos_offset.view(-1, 9, 1)
         else:
             des_ftip_pos = ftip_pos_offset.view(-1, 9, 1)
@@ -1375,14 +1372,8 @@ class TrifingerEnv(IsaacEnvBase):
 
         goal_err = (des_ftip_pos - ftip_pos).view(self.num_instances, 3, 3, 1)
         lmbda = torch.eye(3, dtype=torch.float, device=self.device) * (self._lmbda ** 2)
-        pos_err = (Ji @ torch.inverse(Ji @ Ji_T + lmbda) @ goal_err).view(self.num_instances, 9)
-        if self.config["command_mode"] in ["fingertip_pos_offset_position", "fingertip_pos_position"]:
-            return pos_err + self._dof_position
-        computed_torque = self._robot_dof_gains["stiffness"] * (
-            pos_err
-        )
-        computed_torque -= self._robot_dof_gains["damping"] * self._dof_velocity
-        return computed_torque
+        pos_err = (Ji_T @ torch.inverse(Ji @ Ji_T + lmbda) @ goal_err).view(self.num_instances, 9)
+        return pos_err + self._dof_position
 
     def _compute_ftip_goals(self):
         q, t = self._object_state_history[0][:, 3:7], self._object_state_history[0][:, :3]
